@@ -3,6 +3,10 @@
 
 """
 ChangeLog
+May 23 2022
+    - bug fixes
+Oct 30 2020
+    - bug fixes
 Dec 20 2019
 	- added resize of andimated gif with python gifsicle
 Sep 29 2019
@@ -95,7 +99,14 @@ import subprocess
 
 #Global Variables
 ser = False
+
+# Is there a READ SMS service running in the background?
+# If gammu or smstools then do you want this script to restart the service after send/read?
+gammu_service_force_start = False    # make sure gammu-smsd.service is running after output_close
+smstools_service_force_start = True    # make sure smstools.service is running after output_close
+
 debug = False
+custom_at_command = False
 #debug = True
 
 errorcodes =  False
@@ -108,20 +119,20 @@ gConn=None
 filename = inspect.getframeinfo(inspect.currentframe()).filename
 modem_files_path = os.path.dirname(os.path.abspath(filename))+'/modem_tmp_files/'
 modem_file_cutoff_in_days = 10
-imagepath = '/nfs/mycloud/mobilesvr/movie_posters/'
+imagepath = '/nfs/nas/data/live/servers/mobilesvr/movie_posters/'
 send_bulk_mms_path = os.path.dirname(os.path.abspath(filename))+'/send-bulk-mms/images/'
 filebase = os.path.splitext(filename)[0]
-logfile = '/nfs/mycloud/mobilesvr/logs/lte-send.py.log'
-sendlist = '/nfs/mycloud/mobilesvr/logs/text-message-sent-list.txt'
+logfile = '/nfs/nas/data/live/servers/mobilesvr/logs/lte-send.py.log'
+sendlist = '/nfs/nas/data/live/servers/mobilesvr/logs/text-message-sent-list.txt'
 errorCodesFile = os.path.dirname(os.path.abspath(filename))+'/errorcodes.py'
 atfile = os.path.dirname(os.path.abspath(filename))+'/at_commands.txt'
-dbpath = '/nfs/mycloud/mobilesvr/database/'
-DBFILE = dbpath+'lte_modem_send.sqlite.db'
-database_reachable = os.path.isdir(DBFILE)   
+dbpath = '/nfs/nas/data/live/servers/mobilesvr/database/'
+DBFILE = dbpath+'mobilesvr.db'
+database_reachable = os.path.isfile(DBFILE)
 
 # Connection Details
-#default_baudrate='115200'
-default_baudrate='9600'
+default_baudrate='115200'
+#default_baudrate='9600'
 default_port='/dev/ttyUSB3'
 default_output='json'
 
@@ -140,6 +151,11 @@ default_img_size = 500
 # Image Max filesize in bytes. gif images are ignored
 max_image_filesize = 300000
 
+# For Logging
+# ------------------------
+default_mqttid = ''
+default_friendlytitle = ''
+
 
 logging.basicConfig(filename=logfile,level=logging.DEBUG)
 #logging.debug('This message should go to the log file')
@@ -149,7 +165,7 @@ logging.basicConfig(filename=logfile,level=logging.DEBUG)
 # Trim files
 rc = subprocess.call("echo \"$(tail -n 150 "+logfile+")\" > "+logfile, shell=True)
 rc = subprocess.call("echo \"$(tail -n 150 "+atfile+")\" > "+atfile, shell=True)
-rc = subprocess.call("echo \"$(tail -n 150 "+sendlist+")\" > "+sendlist, shell=True)
+rc = subprocess.call("echo \"$(tail -n 400 "+sendlist+")\" > "+sendlist, shell=True)
 
 
 """
@@ -195,11 +211,12 @@ modem[6]    = { 'desc' : 'Support Field',
 					'query': 'AT+QMMSCFG="supportfield"', 
 					'expected': '"supportfield",0', 
 					'correct': 'AT+QMMSCFG="supportfield",0'}
+'''
 modem[7]    = { 'desc' : 'Network Registered Status',
 					'query': 'AT+CREG?', 
 					'expected': '+CREG: 0,1', 
 					'correct': ''}
-								
+'''								
 char_ascii={}
 char_ascii[0]= { 'desc' : 'Character Set',
 					'query': 'AT+QMMSCFG="character"', 
@@ -248,18 +265,17 @@ def get_cursor():
 def create_table(commit=True):
 	#cur = get_cursor()
 	get_db_connection().execute(
-		''' CREATE TABLE IF NOT EXISTS send (
-										id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
-										recipient text,
-										title text,
-										message text,
-										image text,
-										sent integer NOT NULL DEFAULT 0,
-										tries integer NOT NULL DEFAULT 1,
-										start_date text,
-										sent_date text
-									); ''' 
+		''' CREATE TABLE IF NOT EXISTS 'msgs' (
+				'id' INTEGER PRIMARY KEY NOT NULL,
+				'mobile' TEXT NOT NULL,
+				'msg' TEXT NOT NULL,
+				'sent_at' DATETIME NOT NULL DEFAULT (DATETIME(CURRENT_TIMESTAMP, 'LOCALTIME')),
+				'twofactor' TEXT DEFAULT '',
+				'mqttid' TEXT DEFAULT '',
+				'friendlytitle' TEXT DEFAULT ''
+				); '''
 		)
+
 
 def table(action, details):
 
@@ -270,24 +286,23 @@ def table(action, details):
 
 	do_sql=True
 	if 'insert' in action:
-		data = get_tuple_values(["recipient", "title", "message", "image"], details)
-		data = data + (get_date() ,)
-		SQL_CMD = '''INSERT INTO send(recipient, title, message, image, start_date) VALUES(?,?,?,?,?)'''
+		data = get_tuple_values(["mobile", "msg", "twofactor", "mqttid", "friendlytitle"], details)
+		SQL_CMD = '''INSERT INTO msgs(mobile, msg, twofactor, mqttid, friendlytitle) VALUES(?,?,?,?,?)'''
 
-	elif 'update' in action:
-		data = get_tuple_values(["sent", "tries"], details)
-		if details['sent'] == 1:
-			data = data + (get_date() ,)
-		else:
-			data = data + ('',)
-		data = data + (details['id'] ,)
-		SQL_CMD = '''UPDATE send SET sent = ?, tries = ?, sent_date = ? WHERE id = ?'''
+	# elif 'update' in action:
+	# 	data = get_tuple_values(["sent", "tries"], details)
+	# 	if details['sent'] == 1:
+	# 		data = data + (get_date() ,)
+	# 	else:
+	# 		data = data + ('',)
+	# 	data = data + (details['id'] ,)
+	# 	SQL_CMD = '''UPDATE send SET sent = ?, tries = ?, sent_date = ? WHERE id = ?'''
 
 	elif 'delete' in action:
 		days = int(details['days'])
 		data = get_past_date(days)
 		# DELETE FROM "send" WHERE "sent_date" < "2018-06-18 21:45:13"
-		SQL_CMD = '''DELETE FROM send WHERE sent_date < ?'''
+		SQL_CMD = '''DELETE FROM msgs WHERE sent_at < ?'''
 
 	else:
 		do_sql=False
@@ -297,7 +312,7 @@ def table(action, details):
 		conn = get_db_connection()
 		cur = get_cursor()
 
-		debug_msg("Submitting SQL")
+		debug_msg("Submitting SQL Query")
 		debug_msg(" - "+SQL_CMD)
 
 		do_commit = True
@@ -394,7 +409,7 @@ def output_close(myobject):
 	error = '{"status":"error","result":'
 	myoutput = "output_close: arg is not type str or list"
 
-	global args
+	global args, ser, gammu_service_force_start, smstools_service_force_start
 
 	if not args['json']:
 		if type(myobject) is list and type(myobject[0]) is dict:
@@ -429,6 +444,28 @@ def output_close(myobject):
 	print (myoutput)
 	
 	close_serial_connection()
+
+	if gammu_service_force_start:
+		p = subprocess.Popen("sudo systemctl start gammu-smsd",shell=True,stdout=subprocess.PIPE)
+		time.sleep(2)
+		p = subprocess.Popen("sudo lsof | grep "+ser.port,shell=True,stdout=subprocess.PIPE)
+		line = p.stdout.readline()
+		if line:
+			debug_msg('Started gammu-smsd.service')
+		else:
+			debug_msg('Could not start gammu-smsd.service')
+			error = True
+
+	if smstools_service_force_start:
+		p = subprocess.Popen("sudo systemctl start smstools",shell=True,stdout=subprocess.PIPE)
+		time.sleep(2)
+		p = subprocess.Popen("sudo lsof | grep "+ser.port,shell=True,stdout=subprocess.PIPE)
+		line = p.stdout.readline()
+		if line:
+			debug_msg('Started smstools.service')
+		else:
+			debug_msg('Could not start smstools.service')
+			error = True
 
 	if not error:
 		sys.exit(0)
@@ -528,7 +565,7 @@ Function to Initialize the Serial Port
 """
 def init_serial():
 
-	global ser          # Must be declared in Each Function
+	global ser
 
 	ser = serial.Serial()
 
@@ -541,7 +578,7 @@ def init_serial():
 
 	#Specify the TimeOut in seconds, so that SerialPort
 	#Doesn't hangs
-	ser.timeout = .5
+	ser.timeout = 0
 
 	# -----------------------------------
 	# Check is the Serial Port is being used 
@@ -550,19 +587,23 @@ def init_serial():
 
 	while True:
 		p = subprocess.Popen(cmd,shell=True,stdout=subprocess.PIPE)
-		output = p.communicate()[0]
-		if output:
-			msg = 'Serial Port ' + str(ser.port) + ' ' + str(ser.baudrate) + ' is being used by ...'
+		line = p.stdout.readline()
+		if line:
+			msg = 'Serial Port ' + str(ser.port) + ' ' + str(ser.baudrate) + ' is being used'
 			debug_msg(msg)
-			txt = output.split('\n')
-			for line in txt:
-				if line:
-					val = line.split()
-					msg = str(val[0]) + ' PID: ' + str(val[1])
-					debug_msg(msg)
+			val = line.split()
+			msg = str(val[0].decode("utf-8")) + ' PID: ' + str(val[1].decode("utf-8"))
+			debug_msg(msg)
 
-			debug_msg("Trying again in 60 seconds...")
-			time.sleep(60)  # Try again in 1 minute
+			if 'gammu-sms' in str(val[0].decode("utf-8")):
+				debug_msg("Shutting down gammu-smsd...")
+				p = subprocess.Popen("sudo systemctl stop gammu-smsd",shell=True,stdout=subprocess.PIPE)
+			elif 'smsd' in str(val[0].decode("utf-8")):
+				debug_msg("Shutting down smstools...")
+				p = subprocess.Popen("sudo systemctl stop smstools",shell=True,stdout=subprocess.PIPE)
+			else:
+				debug_msg("Trying again in 60 seconds...")
+				time.sleep(60)  # Try again in 1 minute
 
 		else:
 			msg = 'Serial Port ' + str(ser.port) + ' ' + str(ser.baudrate) + ' seems to be free to use'
@@ -622,7 +663,7 @@ string - if function is 5 then filename of attachement
 
 Query the setting command('AT+QMMSEDIT=4')
 """
-def create_message(recipient, message, images=[], title='', altmsg='', img_userpass='', img_delay=0, img_qty=1, img_qty_delay=1):
+def create_message(recipient, message, images=[], twofactor='', mqttid='', friendlytitle='', title='', altmsg='', img_userpass='', img_delay=0, img_qty=1, img_qty_delay=1):
 
 	global textfile_holder
 	global saved_image_files
@@ -657,11 +698,13 @@ def create_message(recipient, message, images=[], title='', altmsg='', img_userp
 		# send to multiple recipeints by BCC
 		rec='3'
 		rectext='BCC'
+		
 	for mobile in mobile_list:
 		at_command('AT+QMMSEDIT='+rec+',1,"'+mobile+'"') # to phone no.
-		debug_msg(' - Added '+rectext+' to send: '+mobile)
+		debug_msg(' - Added '+rectext+' to send: '+mobile+' ('+mqttid+')')
 
 	details['recipient']=recipient
+	details['mobile']=recipient  # this value is used when saving to DB
 
 	# Attach Title
 	if title:
@@ -719,9 +762,30 @@ def create_message(recipient, message, images=[], title='', altmsg='', img_userp
 
 		debug_msg(' - Message: '+message)
 		details['message']=message
+		details['msg']=urllib.parse.unquote_plus(message)  #for database entry
 	else:
 		debug_msg(' - Message: none given')
 		details['message']='none given'
+		details['msg']=details['message']
+
+	if twofactor:
+		twofactor=twofactor.replace('"', '')
+		twofactor=twofactor.replace('\'', '')
+		details['twofactor']=twofactor   # for database entry
+	else:
+		details['twofactor']=''
+
+	if mqttid:
+		debug_msg(' - Mqtt ID: '+mqttid)
+		details['mqttid']=mqttid   # for database entry
+	else:
+		details['mqttid']=''
+
+	if friendlytitle:
+		debug_msg(' - Friendly Title: '+friendlytitle)
+		details['friendlytitle']=friendlytitle   # for database entry
+	else:
+		details['friendlytitle']=''
 
 	return details
 
@@ -915,7 +979,8 @@ def download_image(url, userpass='', imgid=1):
 		auth=userpass.split(':')
 		debug_msg("Using Basic Authentication: User: "+auth[0]+", Pass: "+auth[1])
 
-		base64string = base64.b64encode('%s:%s' % (auth[0], auth[1]))
+		inbytes = userpass.encode()
+		base64string = base64.b64encode(inbytes)
 		hdr.add_header("Authorization", "Basic %s" % base64string)  
 
 	try: 
@@ -1345,7 +1410,7 @@ def make_text_file(mystr):
 		debug_msg("Error: "+fn+" could not be created")
 		close_serial_connection()
 
-	debug_msg("Created: "+fn)
+	debug_msg("Created Msg Text File: "+fn)
 
 	return fn
 #Function Ends Here
@@ -1382,7 +1447,6 @@ Send Message
 """
 def send_message(details):
  
-
 	recid = table('delete', {'days':30})
 	recid = table('insert', details)
 	details['id'] = recid
@@ -1404,11 +1468,11 @@ def send_message(details):
 			else:
 				count += 1
 				details['tries'] = count
-				table('update', details)
+				#table('update', details)
 		else:
 			debug_msg(" - Success")
 			details['sent'] = 1
-			table('update', details)
+			#table('update', details)
 			return True
 
 # Function Ends Here
@@ -1474,15 +1538,19 @@ Files
 						{error}
 Note
 ----
-		If Title(-t) and File(-i) are not supplied
+		If Title(-s) and File(-i) are not supplied
 		then SMS Message will be used to send
+
+		All sent messages are save to a sqlite3 database
+		Filename:       {db}
 Author
 ------
 		Michael Connors
 		daddyfix@outlook.com
 				
 """.format( log=logfile,
-			error=errorCodesFile
+			error=errorCodesFile,
+			db=DBFILE
 )
 parser = argparse.ArgumentParser(
 				description='Script to send MMS/SMS Messages to one or more recipients',
@@ -1507,14 +1575,21 @@ This can be repeated multiple times
 message_help = """** Required if No Image supplied**
 Attach text to MMS message
 Message can have line feed with \\n"""
+
+twofactor_help = """** NOT Required **
+Add a secret phrase or 4 digit number that the reciever
+reponds to for a two-factor authenication check.\\n"""
 #-----------------------------------------------------------
 # Regular Args
 #-----------------------------------------------------------
 parser.add_argument('-r','--recipient', help=recipient_help, required=False)
 parser.add_argument('-m','--message', help=message_help, required=False)
-parser.add_argument('-t','--title', help='Attach a title to the MMS Message', required=False)
+parser.add_argument('-s','--title', help='Attach a title to the MMS Message', required=False)
 parser.add_argument('-i','--image', dest='images', action='append', help='Attach one or more image files (ie .jpg .png .gif) or Url to Image', required=False)
+parser.add_argument('-t','--twofactor', help=twofactor_help, required=False)
 parser.add_argument('-z','--imgresize', help='Resize while maintaining aspect ratio and exit. Give one integer. So, 300 = 300x300', required=False)
+parser.add_argument('--mqttid', help='The recipients MQTT ID (used in logs)', required=False)
+parser.add_argument('--friendlytitle', help='A text friendly title of the media (used in logs)', required=False)
 parser.add_argument('--imguserpass', help='Basic Http Authentication for Image URL. Format <username>:<password>', required=False)
 parser.add_argument('--imgdelay', help='Delay in seconds before downloading image from url. Default: '+default_img_delay+' secs', required=False)
 parser.add_argument('--imgqty', help='Number of image calls made to image url. Default: '+default_img_qty, required=False)
@@ -1534,6 +1609,7 @@ parser.add_argument('-p','--path', help=mystr, required=False)
 parser.add_argument('-b','--baudrate', help='Default: '+default_baudrate, required=False)
 parser.add_argument('-o','--port', help='Default: '+default_port, required=False)
 parser.add_argument('-d','--debug', action='store_true', help='Default: '+str(debug), required=False)
+parser.add_argument('--atcmd', help='Send an AT COMMAND to the gsm modem and display the response', required=False)
 parser.add_argument('--json', action='store_true', help='Output results as json [Default]', required=False)
 parser.add_argument('--text', action='store_true', help='Output results as text', required=False)
 parser.add_argument('--output', help='json or text. Default: '+default_output, required=False)
@@ -1541,9 +1617,10 @@ parser.add_argument('--output', help='json or text. Default: '+default_output, r
 # Add all the Command Line args to array(list)
 args = vars(parser.parse_args())
 
-if args['message'] is None and args['image'] is None:
-	parser.print_help()
-	sys.exit()
+if 'message' not in args.keys():
+	if 'image' not in args.keys():
+		parser.print_help()
+		sys.exit()
 
 # set the defaults
 if not args['baudrate']:
@@ -1554,6 +1631,13 @@ if not args['text'] and not args['json']:
 	args['json'] = True
 if args['debug']:
 	debug = True
+if args['atcmd']:
+	debug = True
+	custom_at_command = True
+if not args['mqttid']:
+	args['mqttid'] = default_mqttid
+if not args['friendlytitle']:
+	args['friendlytitle'] = default_friendlytitle
 if not args['imgnodelete']:
 	args['imgnodelete'] = default_img_no_delete
 else:
@@ -1632,13 +1716,22 @@ clear_ram(True)
 
 debug_msg( "Args Given: "+str(args)[1:-1] )
 
+"""
+
+Send an AT COMMAND to the gsm modem
+
+"""
+if custom_at_command:
+	ret = at_command( args['atcmd'] )
+	output_close(ret)
+
 
 """
 
 Create a Message and Send 
 
 """
-details_dict = create_message(args['recipient'], args['message'], args['images'], args['title'], args['altmsg'], args['imguserpass'], args['imgdelay'], args['imgqty'], args['imgqtydelay'])
+details_dict = create_message(args['recipient'], args['message'], args['images'], args['twofactor'], args['mqttid'], args['friendlytitle'], args['title'], args['altmsg'], args['imguserpass'], args['imgdelay'], args['imgqty'], args['imgqtydelay'])
 
 status = send_message(details_dict)
 
@@ -1655,12 +1748,20 @@ else:
 	if args['message'] is None:
 		message='empty'
 	else:
-		message = args['message']
+		message = urllib.parse.unquote_plus(args['message'])
 
 	if args['images']:
 		if args['altmsg']:
 			message = args['altmsg']
 
-	senddetails = args['recipient']+" -> "+message
+	mqtttmp = '(unknown)'
+	if args['mqttid']:
+		mqtttmp = '('+args['mqttid']+')'
+
+	# if the message has an imdb link (Click for Details) then substitute with friendly title
+	if args['friendlytitle'] and 'Click' in message:
+		message = args['friendlytitle']+' (with IMDB link)'
+
+	senddetails = args['recipient']+' '+mqtttmp+" -> "+message
 	save_send_details(senddetails)
 	output_close(msg)
